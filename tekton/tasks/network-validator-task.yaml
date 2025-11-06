@@ -1,0 +1,217 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: gcp-network-validator
+  labels:
+    app: gcp-validation
+    validator: network
+spec:
+  description: |
+    Validates GCP network configuration (VPC, subnet, IP availability).
+    Implemented in bash.
+
+    Depends on: API validator (required APIs must be enabled)
+  params:
+    - name: project-id
+      type: string
+      description: GCP project ID
+      default: "demo-project"
+    - name: region
+      type: string
+      description: GCP region
+      default: "us-central1"
+    - name: network-name
+      type: string
+      description: VPC network name
+      default: "default"
+    - name: subnet-name
+      type: string
+      description: Subnet name
+      default: "default-us-central1"
+    - name: min-available-ips
+      type: string
+      description: Minimum available IP addresses required
+      default: "256"
+    - name: force-failure
+      type: string
+      description: Set to "true" to simulate validation failure, "false" for success
+      default: "false"
+  results:
+    - name: status
+      description: Validation status (SUCCESS or FAILED)
+    - name: message
+      description: Human-readable validation result message
+    - name: details
+      description: JSON object with validation details
+  steps:
+    - name: validate-network
+      image: alpine:3.19
+      env:
+        - name: GCP_PROJECT
+          value: $(params.project-id)
+        - name: GCP_REGION
+          value: $(params.region)
+        - name: NETWORK_NAME
+          value: $(params.network-name)
+        - name: SUBNET_NAME
+          value: $(params.subnet-name)
+        - name: MIN_AVAILABLE_IPS
+          value: $(params.min-available-ips)
+        - name: FORCE_FAILURE
+          value: $(params.force-failure)
+      script: |
+        #!/bin/sh
+        set -e
+
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "🔍 GCP Network Validation"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+
+        # Configuration
+        PROJECT="${GCP_PROJECT:-demo-project}"
+        REGION="${GCP_REGION:-us-central1}"
+        NETWORK_NAME="${NETWORK_NAME:-default}"
+        SUBNET_NAME="${SUBNET_NAME:-default-$REGION}"
+        MIN_AVAILABLE_IPS="${MIN_AVAILABLE_IPS:-256}"
+        FORCE_FAIL="${FORCE_FAILURE:-false}"
+
+        echo "📋 Configuration:"
+        echo "   Project: $PROJECT"
+        echo "   Region: $REGION"
+        echo "   Network: $NETWORK_NAME"
+        echo "   Subnet: $SUBNET_NAME"
+        echo "   Required available IPs: $MIN_AVAILABLE_IPS"
+        echo "   Force Failure: $FORCE_FAIL"
+        echo ""
+
+        # Mock network data (simulating API response)
+        # Adjust based on force-failure parameter
+        if [ "$FORCE_FAIL" = "true" ]; then
+          # Set network configuration to trigger failure
+          NETWORK_EXISTS=false  # Network doesn't exist
+          SUBNET_EXISTS=false
+          SUBNET_REGION="us-central1"
+          AVAILABLE_IPS=100  # Insufficient IPs
+        else
+          # Set network configuration for success
+          NETWORK_EXISTS=true
+          SUBNET_EXISTS=true
+          SUBNET_REGION="us-central1"
+          AVAILABLE_IPS=512  # Sufficient IPs
+        fi
+
+        echo "🔍 Validating network configuration..."
+        echo ""
+
+        # Check 1: VPC Network exists
+        echo "1️⃣  VPC Network Check:"
+        echo "   Network Name: $NETWORK_NAME"
+
+        NETWORK_STATUS="PASSED"
+        if [ "$NETWORK_EXISTS" = true ]; then
+            echo "   ✅ PASSED: Network exists"
+        else
+            echo "   ❌ FAILED: Network not found"
+            NETWORK_STATUS="FAILED"
+        fi
+        echo ""
+
+        # Check 2: Subnet exists
+        echo "2️⃣  Subnet Check:"
+        echo "   Subnet Name: $SUBNET_NAME"
+        echo "   Expected Region: $REGION"
+        echo "   Actual Region: $SUBNET_REGION"
+
+        SUBNET_STATUS="PASSED"
+        if [ "$SUBNET_EXISTS" = false ]; then
+            echo "   ❌ FAILED: Subnet not found"
+            SUBNET_STATUS="FAILED"
+        elif [ "$SUBNET_REGION" != "$REGION" ]; then
+            echo "   ❌ FAILED: Subnet is in wrong region"
+            SUBNET_STATUS="FAILED"
+        else
+            echo "   ✅ PASSED: Subnet exists in correct region"
+        fi
+        echo ""
+
+        # Check 3: IP address availability
+        echo "3️⃣  IP Address Availability Check:"
+        echo "   Available IPs: $AVAILABLE_IPS"
+        echo "   Required IPs: $MIN_AVAILABLE_IPS"
+
+        IP_AVAIL_STATUS="PASSED"
+        if [ $AVAILABLE_IPS -lt $MIN_AVAILABLE_IPS ]; then
+            echo "   ❌ FAILED: Insufficient available IP addresses"
+            IP_AVAIL_STATUS="FAILED"
+        else
+            echo "   ✅ PASSED: Sufficient IP addresses available"
+        fi
+        echo ""
+
+        # Determine overall status
+        OVERALL_STATUS="SUCCESS"
+        FAILED_CHECKS=""
+
+        if [ "$NETWORK_STATUS" = "FAILED" ]; then
+            OVERALL_STATUS="FAILED"
+            FAILED_CHECKS="Network"
+        fi
+
+        if [ "$SUBNET_STATUS" = "FAILED" ]; then
+            OVERALL_STATUS="FAILED"
+            if [ -n "$FAILED_CHECKS" ]; then
+                FAILED_CHECKS="$FAILED_CHECKS, Subnet"
+            else
+                FAILED_CHECKS="Subnet"
+            fi
+        fi
+
+        if [ "$IP_AVAIL_STATUS" = "FAILED" ]; then
+            OVERALL_STATUS="FAILED"
+            if [ -n "$FAILED_CHECKS" ]; then
+                FAILED_CHECKS="$FAILED_CHECKS, IP-Availability"
+            else
+                FAILED_CHECKS="IP-Availability"
+            fi
+        fi
+
+        # Build result message
+        if [ "$OVERALL_STATUS" = "SUCCESS" ]; then
+            MESSAGE="All network checks passed: VPC, subnet, and IP availability validated successfully"
+        else
+            MESSAGE="Network validation failed: Issues found with $FAILED_CHECKS"
+        fi
+
+        # Build details JSON
+        DETAILS=$(cat <<EOF
+        {
+          "project": "$PROJECT",
+          "region": "$REGION",
+          "network": "$NETWORK_NAME",
+          "subnet": "$SUBNET_NAME",
+          "available_ips": "$AVAILABLE_IPS",
+          "network_status": "$NETWORK_STATUS",
+          "subnet_status": "$SUBNET_STATUS",
+          "ip_availability_status": "$IP_AVAIL_STATUS"
+        }
+        EOF
+        )
+
+        # Write results to Tekton result files
+        echo -n "$OVERALL_STATUS" > $(results.status.path)
+        echo -n "$MESSAGE" > $(results.message.path)
+        echo -n "$DETAILS" > $(results.details.path)
+
+        # Print summary
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "📊 Validation Status: $OVERALL_STATUS"
+        echo "📝 Message: $MESSAGE"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        # Exit with appropriate code
+        if [ "$OVERALL_STATUS" = "FAILED" ]; then
+            exit 1
+        fi
+
+        exit 0

@@ -1,0 +1,29 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: gcp-validation-run-
+  labels:
+    app: gcp-validation
+    demo: "true"
+spec:
+  pipelineRef:
+    name: gcp-validation-pipeline
+  params:
+    - name: project-id
+      value: "demo-project"
+    - name: region
+      value: "us-central1"
+    - name: network-name
+      value: "default"
+    - name: subnet-name
+      value: "default-us-central1"
+    # Control validator success/failure for different demo scenarios
+    # Scenario 1 (default): API fails, Quota and Network pass
+    - name: api-force-failure
+      value: "false"
+    - name: quota-force-failure
+      value: "false"
+    - name: network-force-failure
+      value: "true"
+  timeouts:
+    pipeline: 10m
