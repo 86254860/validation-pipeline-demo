@@ -1,0 +1,308 @@
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: gcp-validation-pipeline
+  labels:
+    app: gcp-validation
+spec:
+  description: |
+    GCP Cluster Validation Pipeline - Demo
+
+    This pipeline validates GCP cluster configurations with 3 validators:
+    1. API Validator (Go) - Checks if required APIs are enabled
+    2. Quota Validator (Bash) - Checks quotas (depends on API validator)
+    3. Network Validator (Bash) - Checks network config (depends on API validator)
+
+    Dependency chain: API → (Quota and Network run in parallel)
+
+    To add a new validator:
+    1. Add the task definition in the tasks section
+    2. Add the task status parameter in finally.aggregate-results.params
+    3. Add the task name to the validators list (format: "task-name:DisplayName")
+    4. Add a case in the get_status() function in the script
+  params:
+    - name: project-id
+      type: string
+      description: GCP project ID
+      default: "demo-project"
+    - name: region
+      type: string
+      description: GCP region
+      default: "us-central1"
+    - name: network-name
+      type: string
+      description: VPC network name
+      default: "default"
+    - name: subnet-name
+      type: string
+      description: Subnet name
+      default: "default-us-central1"
+    - name: api-force-failure
+      type: string
+      description: Force API validator to fail (true/false)
+      default: "true"
+    - name: quota-force-failure
+      type: string
+      description: Force Quota validator to fail (true/false)
+      default: "false"
+    - name: network-force-failure
+      type: string
+      description: Force Network validator to fail (true/false)
+      default: "false"
+
+  results:
+    - name: overall-status
+      description: Overall validation status (SUCCESS or FAILED)
+      value: $(finally.aggregate-results.results.overall-status)
+    - name: validation-reason
+      description: One-sentence summary of validation result
+      value: $(finally.aggregate-results.results.reason)
+    - name: validation-summary
+      description: Detailed JSON summary of all validation results
+      value: $(finally.aggregate-results.results.summary)
+
+  tasks:
+    # Task 1: API Validation (first in chain)
+    - name: validate-apis
+      taskRef:
+        name: gcp-api-validator
+      params:
+        - name: project-id
+          value: $(params.project-id)
+        - name: required-apis
+          value: "compute.googleapis.com,container.googleapis.com,iam.googleapis.com"
+        - name: force-failure
+          value: $(params.api-force-failure)
+
+    # Task 2: Quota Validation (depends on API validation)
+    - name: validate-quotas
+      taskRef:
+        name: gcp-quota-validator
+      params:
+        - name: project-id
+          value: $(params.project-id)
+        - name: region
+          value: $(params.region)
+        - name: min-cpu
+          value: "4"
+        - name: min-memory
+          value: "16"
+        - name: min-ips
+          value: "10"
+        - name: force-failure
+          value: $(params.quota-force-failure)
+      runAfter:
+        - validate-apis
+
+    # Task 3: Network Validation (depends on API validation, runs in parallel with Quota)
+    - name: validate-network
+      taskRef:
+        name: gcp-network-validator
+      params:
+        - name: project-id
+          value: $(params.project-id)
+        - name: region
+          value: $(params.region)
+        - name: network-name
+          value: $(params.network-name)
+        - name: subnet-name
+          value: $(params.subnet-name)
+        - name: min-available-ips
+          value: "256"
+        - name: force-failure
+          value: $(params.network-force-failure)
+      runAfter:
+        - validate-apis
+
+  finally:
+    # Final task: Aggregate all validation results
+    # This task is designed to be easily extensible - just add new tasks to the validators list
+    - name: aggregate-results
+      params:
+        # List of validator tasks in format: "task-name:display-name"
+        - name: validators
+          value: "validate-apis:API,validate-quotas:Quota,validate-network:Network"
+        - name: api-status
+          value: $(tasks.validate-apis.status)
+        - name: quota-status
+          value: $(tasks.validate-quotas.status)
+        - name: network-status
+          value: $(tasks.validate-network.status)
+      taskSpec:
+        params:
+          - name: validators
+            description: "Comma-separated list of validators in format task-name:display-name"
+          - name: api-status
+          - name: quota-status
+          - name: network-status
+        results:
+          - name: overall-status
+            description: Overall validation status (SUCCESS or FAILED)
+          - name: summary
+            description: Detailed summary of all validations
+          - name: reason
+            description: One-sentence summary of validation result
+        steps:
+          - name: aggregate
+            image: alpine:3.19
+            script: |
+              #!/bin/sh
+              set -e
+
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo "📊 GCP Validation Pipeline - Results Aggregation"
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo ""
+
+              # Parse validators list from parameter
+              VALIDATORS="$(params.validators)"
+
+              # Helper function to get status parameter by task name
+              get_status() {
+                  case "$1" in
+                      "validate-apis") echo "$(params.api-status)" ;;
+                      "validate-quotas") echo "$(params.quota-status)" ;;
+                      "validate-network") echo "$(params.network-status)" ;;
+                      *) echo "None" ;;
+                  esac
+              }
+
+              # Helper function to convert task status to validation result
+              status_to_result() {
+                  local status=$1
+                  local display_name=$2
+
+                  case "$status" in
+                      "Succeeded")
+                          echo "SUCCESS|${display_name} validation completed successfully"
+                          ;;
+                      "Failed")
+                          echo "FAILED|${display_name} validation failed"
+                          ;;
+                      *)
+                          echo "SKIPPED|${display_name} validation was skipped due to dependency failure"
+                          ;;
+                  esac
+              }
+
+              # Initialize counters
+              OVERALL_STATUS="SUCCESS"
+              FAILED_VALIDATORS=""
+              PASSED_COUNT=0
+              FAILED_COUNT=0
+              SKIPPED_COUNT=0
+              TOTAL_COUNT=0
+
+              # Build JSON validations object
+              VALIDATIONS_JSON=""
+
+              # Process each validator
+              IFS=','
+              COUNTER=1
+              for validator in $VALIDATORS; do
+                  # Parse task-name:display-name
+                  TASK_NAME=$(echo "$validator" | cut -d: -f1)
+                  DISPLAY_NAME=$(echo "$validator" | cut -d: -f2)
+                  TOTAL_COUNT=$((TOTAL_COUNT + 1))
+
+                  # Get task status
+                  TASK_STATUS=$(get_status "$TASK_NAME")
+
+                  # Convert to result and message
+                  RESULT_MSG=$(status_to_result "$TASK_STATUS" "$DISPLAY_NAME")
+                  RESULT=$(echo "$RESULT_MSG" | cut -d'|' -f1)
+                  MESSAGE=$(echo "$RESULT_MSG" | cut -d'|' -f2)
+
+                  # Print individual result
+                  echo "${COUNTER}️⃣  ${DISPLAY_NAME} Validation:"
+                  echo "   Task Status: $TASK_STATUS"
+                  echo "   Result: $RESULT"
+                  echo "   Message: $MESSAGE"
+                  echo ""
+
+                  # Update counters and failed validators list
+                  if [ "$TASK_STATUS" = "Succeeded" ] && [ "$RESULT" = "SUCCESS" ]; then
+                      PASSED_COUNT=$((PASSED_COUNT + 1))
+                  elif [ "$TASK_STATUS" = "Failed" ] || [ "$RESULT" = "FAILED" ]; then
+                      FAILED_COUNT=$((FAILED_COUNT + 1))
+                      OVERALL_STATUS="FAILED"
+                      if [ -z "$FAILED_VALIDATORS" ]; then
+                          FAILED_VALIDATORS="$DISPLAY_NAME"
+                      else
+                          FAILED_VALIDATORS="$FAILED_VALIDATORS, $DISPLAY_NAME"
+                      fi
+                  else
+                      SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+                  fi
+
+                  # Build JSON entry for this validator (use task name as key, lowercase)
+                  VALIDATOR_KEY=$(echo "$TASK_NAME" | sed 's/validate-//')
+                  if [ -z "$VALIDATIONS_JSON" ]; then
+                      VALIDATIONS_JSON="\"${VALIDATOR_KEY}\": {\"task_status\": \"$TASK_STATUS\", \"status\": \"$RESULT\", \"message\": \"$MESSAGE\"}"
+                  else
+                      VALIDATIONS_JSON="$VALIDATIONS_JSON, \"${VALIDATOR_KEY}\": {\"task_status\": \"$TASK_STATUS\", \"status\": \"$RESULT\", \"message\": \"$MESSAGE\"}"
+                  fi
+
+                  COUNTER=$((COUNTER + 1))
+              done
+
+              # Generate one-sentence reason
+              if [ "$OVERALL_STATUS" = "FAILED" ]; then
+                  if [ $FAILED_COUNT -eq 1 ]; then
+                      REASON="Validation failed: $FAILED_VALIDATORS validator did not pass"
+                  else
+                      REASON="Validation failed: $FAILED_COUNT validators did not pass ($FAILED_VALIDATORS)"
+                  fi
+              else
+                  if [ $SKIPPED_COUNT -gt 0 ]; then
+                      REASON="Validation succeeded: all $PASSED_COUNT validator(s) passed, $SKIPPED_COUNT skipped"
+                  else
+                      REASON="Validation succeeded: all $TOTAL_COUNT validator(s) passed"
+                  fi
+              fi
+
+              # Create summary JSON with status and reason at top level
+              SUMMARY=$(cat <<EOF
+              {
+                "status": "$OVERALL_STATUS",
+                "reason": "$REASON",
+                "total_validations": $TOTAL_COUNT,
+                "passed": $PASSED_COUNT,
+                "failed": $FAILED_COUNT,
+                "skipped": $SKIPPED_COUNT,
+                "failed_validators": "$FAILED_VALIDATORS",
+                "validations": {
+                  $VALIDATIONS_JSON
+                }
+              }
+              EOF
+              )
+
+              # Print summary
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo "📈 Overall Validation Summary"
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+              echo ""
+              echo "Status: $OVERALL_STATUS"
+              echo "Reason: $REASON"
+              echo ""
+              echo "Total Validations: $TOTAL_COUNT"
+              echo "Passed: $PASSED_COUNT"
+              echo "Failed: $FAILED_COUNT"
+              echo "Skipped: $SKIPPED_COUNT"
+
+              if [ "$OVERALL_STATUS" = "FAILED" ]; then
+                  echo ""
+                  echo "❌ Failed Validators: $FAILED_VALIDATORS"
+              else
+                  echo ""
+                  echo "✅ All validations passed successfully!"
+              fi
+
+              echo ""
+              echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+              # Write results
+              echo -n "$OVERALL_STATUS" > $(results.overall-status.path)
+              echo -n "$SUMMARY" > $(results.summary.path)
+              echo -n "$REASON" > $(results.reason.path)

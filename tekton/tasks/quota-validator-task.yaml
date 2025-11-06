@@ -1,0 +1,229 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: gcp-quota-validator
+  labels:
+    app: gcp-validation
+    validator: quota
+spec:
+  description: |
+    Validates GCP project quotas (CPU, Memory, IP).
+    Implemented in bash.
+
+    Depends on: API validator (compute API must be enabled)
+  params:
+    - name: project-id
+      type: string
+      description: GCP project ID
+      default: "demo-project"
+    - name: region
+      type: string
+      description: GCP region
+      default: "us-central1"
+    - name: min-cpu
+      type: string
+      description: Minimum required CPU cores
+      default: "4"
+    - name: min-memory
+      type: string
+      description: Minimum required memory in GB
+      default: "16"
+    - name: min-ips
+      type: string
+      description: Minimum required IP addresses
+      default: "10"
+    - name: force-failure
+      type: string
+      description: Set to "true" to simulate validation failure, "false" for success
+      default: "false"
+  results:
+    - name: status
+      description: Validation status (SUCCESS or FAILED)
+    - name: message
+      description: Human-readable validation result message
+    - name: details
+      description: JSON object with validation details
+  steps:
+    - name: validate-quotas
+      image: alpine:3.19
+      env:
+        - name: GCP_PROJECT
+          value: $(params.project-id)
+        - name: GCP_REGION
+          value: $(params.region)
+        - name: MIN_CPU_QUOTA
+          value: $(params.min-cpu)
+        - name: MIN_MEMORY_QUOTA
+          value: $(params.min-memory)
+        - name: MIN_IP_QUOTA
+          value: $(params.min-ips)
+        - name: FORCE_FAILURE
+          value: $(params.force-failure)
+      script: |
+        #!/bin/sh
+        set -e
+
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "🔍 GCP Quota Validation"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+
+        # Configuration
+        PROJECT="${GCP_PROJECT:-demo-project}"
+        REGION="${GCP_REGION:-us-central1}"
+        MIN_CPU="${MIN_CPU_QUOTA:-4}"
+        MIN_MEMORY="${MIN_MEMORY_QUOTA:-16}"
+        MIN_IPS="${MIN_IP_QUOTA:-10}"
+        FORCE_FAIL="${FORCE_FAILURE:-false}"
+
+        echo "📋 Configuration:"
+        echo "   Project: $PROJECT"
+        echo "   Region: $REGION"
+        echo "   Required CPU cores: $MIN_CPU"
+        echo "   Required Memory (GB): $MIN_MEMORY"
+        echo "   Required IP addresses: $MIN_IPS"
+        echo "   Force Failure: $FORCE_FAIL"
+        echo ""
+
+        # Mock GCP quota data (simulating API response)
+        # Adjust based on force-failure parameter
+        if [ "$FORCE_FAIL" = "true" ]; then
+          # Set quotas to insufficient values to trigger failure
+          CURRENT_CPU_LIMIT=100
+          CURRENT_CPU_USAGE=98  # Only 2 cores available, need 4
+          CURRENT_MEMORY_LIMIT=256
+          CURRENT_MEMORY_USAGE=245  # Only 11 GB available, need 16
+          CURRENT_IP_LIMIT=50
+          CURRENT_IP_USAGE=45  # Only 5 IPs available, need 10
+        else
+          # Set quotas to sufficient values for success
+          CURRENT_CPU_LIMIT=100
+          CURRENT_CPU_USAGE=85  # 15 cores available
+          CURRENT_MEMORY_LIMIT=256
+          CURRENT_MEMORY_USAGE=200  # 56 GB available
+          CURRENT_IP_LIMIT=50
+          CURRENT_IP_USAGE=5
+        fi
+
+        # Calculate available quotas
+        AVAILABLE_CPU=$((CURRENT_CPU_LIMIT - CURRENT_CPU_USAGE))
+        AVAILABLE_MEMORY=$((CURRENT_MEMORY_LIMIT - CURRENT_MEMORY_USAGE))
+        AVAILABLE_IPS=$((CURRENT_IP_LIMIT - CURRENT_IP_USAGE))
+
+        echo "🔍 Checking quotas..."
+        echo ""
+
+        # Validate CPU quota
+        echo "1️⃣  CPU Quota Check:"
+        echo "   Limit: $CURRENT_CPU_LIMIT cores"
+        echo "   Usage: $CURRENT_CPU_USAGE cores"
+        echo "   Available: $AVAILABLE_CPU cores"
+        echo "   Required: $MIN_CPU cores"
+
+        CPU_STATUS="PASSED"
+        if [ $AVAILABLE_CPU -lt $MIN_CPU ]; then
+            echo "   ❌ FAILED: Insufficient CPU quota"
+            CPU_STATUS="FAILED"
+        else
+            echo "   ✅ PASSED"
+        fi
+        echo ""
+
+        # Validate Memory quota
+        echo "2️⃣  Memory Quota Check:"
+        echo "   Limit: $CURRENT_MEMORY_LIMIT GB"
+        echo "   Usage: $CURRENT_MEMORY_USAGE GB"
+        echo "   Available: $AVAILABLE_MEMORY GB"
+        echo "   Required: $MIN_MEMORY GB"
+
+        MEMORY_STATUS="PASSED"
+        if [ $AVAILABLE_MEMORY -lt $MIN_MEMORY ]; then
+            echo "   ❌ FAILED: Insufficient memory quota"
+            MEMORY_STATUS="FAILED"
+        else
+            echo "   ✅ PASSED"
+        fi
+        echo ""
+
+        # Validate IP quota
+        echo "3️⃣  IP Address Quota Check:"
+        echo "   Limit: $CURRENT_IP_LIMIT addresses"
+        echo "   Usage: $CURRENT_IP_USAGE addresses"
+        echo "   Available: $AVAILABLE_IPS addresses"
+        echo "   Required: $MIN_IPS addresses"
+
+        IP_STATUS="PASSED"
+        if [ $AVAILABLE_IPS -lt $MIN_IPS ]; then
+            echo "   ❌ FAILED: Insufficient IP address quota"
+            IP_STATUS="FAILED"
+        else
+            echo "   ✅ PASSED"
+        fi
+        echo ""
+
+        # Determine overall status
+        OVERALL_STATUS="SUCCESS"
+        FAILED_CHECKS=""
+
+        if [ "$CPU_STATUS" = "FAILED" ]; then
+            OVERALL_STATUS="FAILED"
+            FAILED_CHECKS="CPU"
+        fi
+
+        if [ "$MEMORY_STATUS" = "FAILED" ]; then
+            OVERALL_STATUS="FAILED"
+            if [ -n "$FAILED_CHECKS" ]; then
+                FAILED_CHECKS="$FAILED_CHECKS, Memory"
+            else
+                FAILED_CHECKS="Memory"
+            fi
+        fi
+
+        if [ "$IP_STATUS" = "FAILED" ]; then
+            OVERALL_STATUS="FAILED"
+            if [ -n "$FAILED_CHECKS" ]; then
+                FAILED_CHECKS="$FAILED_CHECKS, IP"
+            else
+                FAILED_CHECKS="IP"
+            fi
+        fi
+
+        # Build result message
+        if [ "$OVERALL_STATUS" = "SUCCESS" ]; then
+            MESSAGE="All quota checks passed: CPU, Memory, and IP quotas are sufficient"
+        else
+            MESSAGE="Quota validation failed: Insufficient quota for $FAILED_CHECKS"
+        fi
+
+        # Build details JSON
+        DETAILS=$(cat <<EOF
+        {
+          "project": "$PROJECT",
+          "region": "$REGION",
+          "cpu_available": "$AVAILABLE_CPU",
+          "memory_available": "$AVAILABLE_MEMORY",
+          "ip_available": "$AVAILABLE_IPS",
+          "cpu_status": "$CPU_STATUS",
+          "memory_status": "$MEMORY_STATUS",
+          "ip_status": "$IP_STATUS"
+        }
+        EOF
+        )
+
+        # Write results to Tekton result files
+        echo -n "$OVERALL_STATUS" > $(results.status.path)
+        echo -n "$MESSAGE" > $(results.message.path)
+        echo -n "$DETAILS" > $(results.details.path)
+
+        # Print summary
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "📊 Validation Status: $OVERALL_STATUS"
+        echo "📝 Message: $MESSAGE"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+        # Exit with appropriate code
+        if [ "$OVERALL_STATUS" = "FAILED" ]; then
+            exit 1
+        fi
+
+        exit 0

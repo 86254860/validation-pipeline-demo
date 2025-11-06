@@ -1,0 +1,44 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: gcp-api-validator
+  labels:
+    app: gcp-validation
+    validator: api
+spec:
+  description: |
+    Validates that required GCP APIs are enabled.
+    Implemented in Go.
+
+    This is the first validation in the chain.
+  params:
+    - name: project-id
+      type: string
+      description: GCP project ID
+      default: "demo-project"
+    - name: required-apis
+      type: string
+      description: Comma-separated list of required APIs
+      default: "compute.googleapis.com,container.googleapis.com,iam.googleapis.com"
+    - name: force-failure
+      type: string
+      description: Set to "true" to simulate validation failure, "false" for success
+      default: "true"
+  results:
+    - name: status
+      description: Validation status (SUCCESS or FAILED)
+    - name: message
+      description: Human-readable validation result message
+    - name: details
+      description: JSON object with validation details
+  steps:
+    - name: validate-apis
+      image: quay.io/rh-ee-dawang/gcp-api-validator:latest
+      imagePullPolicy: Always
+      env:
+        - name: GCP_PROJECT
+          value: $(params.project-id)
+        - name: REQUIRED_APIS
+          value: $(params.required-apis)
+        - name: FORCE_FAILURE
+          value: $(params.force-failure)
